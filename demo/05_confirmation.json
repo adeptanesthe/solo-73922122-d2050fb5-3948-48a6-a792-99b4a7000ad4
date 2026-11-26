@@ -1,0 +1,15 @@
+{
+  "expected_version": 1,
+  "confirmations": [
+    {
+      "segment": 0,
+      "key": "K2",
+      "pressed": true
+    },
+    {
+      "segment": 1,
+      "key": "K2",
+      "pressed": false
+    }
+  ]
+}

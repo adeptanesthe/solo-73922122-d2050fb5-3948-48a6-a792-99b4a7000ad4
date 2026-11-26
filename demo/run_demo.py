@@ -43,6 +43,14 @@ def show(label: str, status: int, body: dict) -> None:
         for take in possibility["takes"]:
             gains = {k: round(v, 4) for k, v in take["gains"].items()}
             print(f"    take {take['segment']}: keys={take['pressed_keys']} gains={gains}")
+    evidence = body.get("evidence") or {}
+    if "key_groups" in evidence:
+        print(f"  equivalence groups: {evidence.get('group_count')} "
+              f"(sizes {[g['size'] for g in evidence['key_groups']]})")
+        for model, diag in (evidence.get("models") or {}).items():
+            if "model_size" in diag:
+                print(f"    {model}: aggregated {diag['model_size']} "
+                      f"vs per-key {diag['per_key_model_size']}")
 
 
 def main() -> None:
@@ -74,6 +82,33 @@ def main() -> None:
 
     status, original = call("GET", f"/analyses/{analysis_id}?version={version}")
     print(f"=== original version {version} still queryable -> HTTP {status}, kind={original.get('kind')}")
+
+    # Equivalence-group beat: six keys share one template and gain interval.
+    # The solver aggregates them (no per-key binaries for unconfirmed members),
+    # yet every witness still names concrete keys and per-key gains.
+    status, grouped = call("POST", "/analyses", load("05_equivalence_group.json"))
+    show("equivalence group (6 identical keys)", status, grouped)
+    group_id = grouped["analysis_id"]
+    group_version = grouped["version"]
+
+    # Pin K2 to opposite states across the two takes: same-set becomes
+    # infeasible and a different-set witness with real key names is returned.
+    status, edited = call(
+        "POST", f"/analyses/{group_id}/confirmations", load("05_confirmation.json")
+    )
+    show("group confirmation (K2 pressed only in take 0)", status, edited)
+    print("  confirmations:", edited.get("confirmations"))
+
+    # Replaying the same expected version is now stale; version 1 survives.
+    status, stale = call(
+        "POST", f"/analyses/{group_id}/confirmations", load("05_confirmation.json")
+    )
+    print("\n=== replayed group confirmation ->", status, stale.get("error", {}).get("code"))
+    status, first = call("GET", f"/analyses/{group_id}?version={group_version}")
+    print(
+        f"=== group report version {group_version} still queryable -> HTTP {status}, "
+        f"kind={first.get('kind')}"
+    )
 
 
 if __name__ == "__main__":

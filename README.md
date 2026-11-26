@@ -19,7 +19,7 @@ Local dev without Docker:
 ```bash
 python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --port 8000
-python -m pytest -q                     # 29 tests
+python -m pytest -q                     # 38 tests
 ```
 
 ## API
@@ -55,6 +55,33 @@ Each key `k` has a non-negative template `T[k,:]`. For a take with gain vector
 bands are `g @ T` and must satisfy `|g @ T - b| <= e` for every band. The two
 takes may use different gains.
 
+### Equivalence groups
+
+With coarse frequency bands, several candidate keys can have an **identical
+template row and identical gain interval**. Such keys are indistinguishable to
+the band equations and are placed in one equivalence group. Inside a group,
+only the *number* of pressed keys matters for feasibility, so fully
+unconfirmed members are modelled collectively:
+
+- one general-integer pressed count `q in [0, s]` and one pooled gain `G` with
+  `lo*q <= G <= hi*q`, instead of one binary and one gain variable per key;
+- adding another fully-unconfirmed key to a group only raises an upper bound —
+  it adds **no variable and no constraint**. With all 24 keys in one
+  unconfirmed group both models are far smaller than the per-key formulation
+  (the report's `evidence.models.*.model_size` vs `per_key_model_size`);
+- a key an editor has confirmed in either take keeps its own binary/gain
+  variables, since a confirmation is the only thing that can name a specific
+  group member. Pool growth on top of confirmations still adds nothing;
+- a feasible group-level solution is expanded afterwards (never enumerated)
+  into concrete key names and per-key gains, then re-verified against the
+  original per-key templates, gain intervals, and band errors.
+
+The different-set hypothesis treats two takes as distinct when either the
+groups' pressed counts differ (exact big-M direction binaries) **or** equal
+counts are realized by different member subsets of an interior count (the `z`
+indicator). Hence equal per-group key counts can still correspond to different
+actual key names.
+
 Two MILPs are solved; neither enumerates key subsets:
 
 - **same** — one shared binary vector `x`, per-take gains `g1,g2`, linked by
@@ -87,6 +114,9 @@ raises rather than guessing.
   confirmations and reports remain queryable.
 - If the confirmed edits make the problem infeasible, the request is rejected
   (409 `infeasible_after_confirmations`) with evidence, and nothing is applied.
+- If a MILP cannot be decided within the time limit, the request fails with
+  503 `solver_inconclusive`; again nothing is applied and the prior report
+  version and confirmations stay queryable.
 - Confirmations that force take 0 and take 1 to different states for a key are
   not an input error: they make the same-set hypothesis infeasible and let the
   different-set hypothesis answer (or produce `impossible` if nothing fits).
@@ -99,6 +129,13 @@ raises rather than guessing.
 4. `04_ambiguous.json` → `both`; apply `04_confirmation.json` to edit, then a
    replayed request with the same `expected_version` returns `stale_version`
    while version 1 stays retrievable.
+5. `05_equivalence_group.json` → six keys sharing one template and gain
+   interval. The solver aggregates them (the reported `model_size` stays flat
+   as unconfirmed members are added) yet every witness still names concrete
+   keys and per-key gains. Applying `05_confirmation.json` pins `K2` to
+   opposite states across the takes, which makes the same-set case infeasible
+   and returns a different-set witness using two distinct group members; the
+   replayed edit is `stale_version` and version 1 remains queryable.
 
 ## Implementation notes / limits
 

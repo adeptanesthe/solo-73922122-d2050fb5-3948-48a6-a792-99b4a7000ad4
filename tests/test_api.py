@@ -369,3 +369,129 @@ def test_too_many_keys_rejected(client: TestClient) -> None:
     resp = client.post("/analyses", json=payload)
     assert resp.status_code == 400
     assert "24" in resp.json()["error"]["message"]
+
+
+def _grouped_payload(size: int) -> dict:
+    # All keys share one spectral template and one gain interval, so they form
+    # a single equivalence group that must be aggregated by the solver.
+    return {
+        "key_names": [f"K{i}" for i in range(size)],
+        "band_names": ["f0", "f1"],
+        "templates": [[1.0, 0.5] for _ in range(size)],
+        "band_energy_1": [1.0, 0.5],
+        "band_error_1": [0.0, 0.0],
+        "band_energy_2": [1.0, 0.5],
+        "band_error_2": [0.0, 0.0],
+        "gain_lower": [0.5] * size,
+        "gain_upper": [1.5] * size,
+    }
+
+
+def test_grouped_keys_aggregate_and_report_real_names(client: TestClient) -> None:
+    small = create(client, _grouped_payload(4))
+    large = create(client, _grouped_payload(24))
+    for report, size in ((small, 4), (large, 24)):
+        assert report["kind"] == "both"
+        assert report["evidence"]["group_count"] == 1
+        assert report["evidence"]["key_groups"][0]["size"] == size
+        for model in ("same", "different"):
+            actual = report["evidence"]["models"][model]["model_size"]
+            per_key = report["evidence"]["models"][model]["per_key_model_size"]
+            assert actual["variables"] < per_key["variables"]
+            assert actual["constraints"] < per_key["constraints"]
+        # Every witness still resolves to concrete key names and per-key gains.
+        for possibility in report["possibilities"]:
+            for take in possibility["takes"]:
+                assert set(take["gains"]) == set(take["pressed_keys"])
+                assert take["pressed_keys"]  # at least one named key
+    # Adding fully-unconfirmed group members must not change model dimensions.
+    def dims(report: dict) -> dict:
+        return {
+            model: report["evidence"]["models"][model]["model_size"]
+            for model in ("same", "different")
+        }
+
+    assert dims(small) == dims(large)
+
+
+def test_group_confirmation_pins_specific_key_name(client: TestClient) -> None:
+    report = create(client, _grouped_payload(6))
+    aid = report["analysis_id"]
+    resp = client.post(
+        f"/analyses/{aid}/confirmations",
+        json={
+            "expected_version": 1,
+            "confirmations": [
+                {"segment": 0, "key": "K2", "pressed": True},
+                {"segment": 1, "key": "K5", "pressed": True},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version"] == 2
+    # Both hypotheses can fit (the shared set {K2, K5} also reproduces the
+    # bands), but every witness must honour the two distinct pinned members.
+    for possibility in body["possibilities"]:
+        take0, take1 = possibility["takes"]
+        assert "K2" in take0["pressed_keys"]
+        assert "K5" in take1["pressed_keys"]
+        if possibility["hypothesis"] == "different":
+            assert take0["pressed_keys"] != take1["pressed_keys"]
+    # Confirmation state is returned alongside the new report version.
+    assert body["confirmations"]["0"] == {"K2": True}
+    assert body["confirmations"]["1"] == {"K5": True}
+
+
+def test_group_confirmation_can_force_different(client: TestClient) -> None:
+    report = create(client, _grouped_payload(6))
+    aid = report["analysis_id"]
+    # Pin the same member to opposite states in the two takes: same-set becomes
+    # impossible, while a different-set witness swapping members still fits.
+    resp = client.post(
+        f"/analyses/{aid}/confirmations",
+        json={
+            "expected_version": 1,
+            "confirmations": [
+                {"segment": 0, "key": "K2", "pressed": True},
+                {"segment": 1, "key": "K2", "pressed": False},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "different"
+    take0, take1 = body["possibilities"][0]["takes"]
+    assert "K2" in take0["pressed_keys"]
+    assert "K2" not in take1["pressed_keys"]
+    # The second take must still produce the energy using another group member.
+    assert take1["pressed_keys"]
+
+
+def test_solver_inconclusive_leaves_report_and_confirmations_intact(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import solver
+
+    class _Undecided:
+        status = 1  # HiGHS: stopped without proving feasibility/infeasibility
+        message = "Time limit reached."
+        x = None
+        mip_node_count = 0
+
+    report = create(client, _grouped_payload(4))
+    aid = report["analysis_id"]
+    monkeypatch.setattr(solver, "milp", lambda *a, **k: _Undecided())
+    resp = client.post(
+        f"/analyses/{aid}/confirmations",
+        json={
+            "expected_version": 1,
+            "confirmations": [{"segment": 0, "key": "K1", "pressed": True}],
+        },
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "solver_inconclusive"
+    state = client.get(f"/analyses/{aid}/confirmations").json()
+    assert state["current_version"] == 1 and state["confirmations"] == {}
+    assert client.get(f"/analyses/{aid}").json()["version"] == 1
+    assert client.get(f"/analyses/{aid}", params={"version": 1}).json()["kind"] == "both"

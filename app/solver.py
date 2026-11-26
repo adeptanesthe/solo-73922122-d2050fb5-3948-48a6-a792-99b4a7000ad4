@@ -8,27 +8,44 @@ An unplayed key has gain exactly zero; a played key has a gain in the closed
 interval ``[lo[k], hi[k]]``.  The take's band energies are
 ``sum_k g[k] * T[k, :]`` and every band must lie in ``[b - e, b + e]``.
 
-Classification uses two mixed-integer programs, one per hypothesis:
+Equivalence groups
+------------------
+With coarse frequency bands, several candidate keys can share an *identical*
+spectral template row and identical gain bounds.  Such keys are
+indistinguishable to the band equations and are collected into one equivalence
+group.  Within a group, only the number of pressed keys matters for feasibility
+(any ``q`` members out of ``s`` can realize it, each with a positive gain), so
+fully-unconfirmed members are modelled collectively instead of one binary per
+key:
 
-* ``same``: both takes share one binary pressed-vector ``x``.
-* ``different``: the two takes have distinct pressed-vectors, enforced with
-  ``d[k] = |x1[k] - x2[k]|`` and ``sum(d) >= 1``.
+* a general-integer pressed-count variable ``q`` with ``0 <= q <= s`` over the
+  group's unconfirmed pool (confirmed members keep their own binaries),
+* one pooled non-negative gain variable ``G`` linked by
+  ``lo*q <= G <= hi*q``.  Because every member of a group shares its gain
+  interval, any feasible pooled gain can be split back into ``q`` per-key gains
+  inside it.
 
-Neither model enumerates key subsets; HiGHS branches on the binaries.  The
-three report outcomes follow directly from feasibility:
+Adding another fully-unconfirmed key to a group therefore only raises an upper
+bound; it introduces **no** new variable and **no** new constraint.  A key that
+an editor has already confirmed in either take keeps its own binary/gain pair,
+which is the only information that can distinguish group members.
 
-* same feasible, different infeasible -> key sets are certainly identical;
-* same infeasible, different feasible -> key sets are certainly different;
-* both feasible                        -> either case is possible;
-* both infeasible                      -> no reconstruction, evidence conflict.
+The same-set hypothesis shares one pressed state per key; the different-set
+hypothesis allows two states, either because the groups' pressed counts differ
+(two direction binaries ``dp``/``dm``) or because the counts coincide but two
+different member subsets of an interior count are chosen (``z``, possible only
+while a group still holds an unconfirmed pool of at least two keys).  No key
+combination is ever enumerated: HiGHS branches on the (group-level) integer
+variables, and a feasible solution is expanded back to concrete key names only
+afterwards.
 
-A strict pin ``lo == hi`` is handled by the same linearisation
-``lo * x <= g <= hi * x``; it remains exact for closed intervals.
+A strict pin ``lo == hi`` is handled by the same linearisation; it remains exact
+for closed intervals.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -132,118 +149,193 @@ def _check_confirmations(conf: Confirmations, keys: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# MILP construction
+# equivalence groups
 # ---------------------------------------------------------------------------
-def _add_gain_block(
-    n: int,
-    m: int,
+@dataclass
+class _Group:
+    """Keys sharing a spectral template row and a gain interval."""
+
+    members: list[int]
+    template: np.ndarray
+    lo: float
+    hi: float
+    # Confirmed keys: key index -> set of segments that pinned it (0/1).
+    confirmed: dict[int, set[int]] = field(default_factory=dict)
+    # Keys not confirmed in either segment, modelled by one pooled block.
+    pool: list[int] = field(default_factory=list)
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+    @property
+    def pool_size(self) -> int:
+        return len(self.pool)
+
+
+def _build_groups(
     templates: np.ndarray,
-    energy: np.ndarray,
-    error: np.ndarray,
     lo: np.ndarray,
     hi: np.ndarray,
-    x_off: int,
-    g_off: int,
-    nv: int,
-    lb: np.ndarray,
-    ub: np.ndarray,
-    rows: list[np.ndarray],
-    rlb: list[float],
-    rub: list[float],
-) -> None:
-    """Link one take's binaries to gains and add its band constraints."""
-    for k in range(n):
-        ub[g_off + k] = hi[k]
-        # g - hi*x <= 0
-        row = np.zeros(nv)
-        row[g_off + k] = 1.0
-        row[x_off + k] = -hi[k]
-        rows.append(row)
-        rlb.append(-_INF)
-        rub.append(0.0)
-        # lo*x - g <= 0
-        row = np.zeros(nv)
-        row[x_off + k] = lo[k]
-        row[g_off + k] = -1.0
-        rows.append(row)
-        rlb.append(-_INF)
-        rub.append(0.0)
-    for j in range(m):
-        row = np.zeros(nv)
-        row[g_off : g_off + n] = templates[:, j]
-        rows.append(row)
-        rlb.append(energy[j] - error[j])
-        rub.append(energy[j] + error[j])
+    conf: Confirmations,
+) -> list[_Group]:
+    """Partition keys into equivalence groups by (template row, lo, hi)."""
+    groups: list[_Group] = []
+    lookup: dict[tuple, _Group] = {}
+    for k in range(templates.shape[0]):
+        signature = (tuple(float(v) for v in templates[k, :]), float(lo[k]), float(hi[k]))
+        group = lookup.get(signature)
+        if group is None:
+            group = _Group(
+                members=[k],
+                template=templates[k, :].copy(),
+                lo=float(lo[k]),
+                hi=float(hi[k]),
+            )
+            lookup[signature] = group
+            groups.append(group)
+        else:
+            group.members.append(k)
+
+    for group in groups:
+        pinned: dict[int, set[int]] = {}
+        for (seg, key), pressed in conf.items():
+            if key in group.members:
+                pinned.setdefault(key, set()).add(seg)
+        group.confirmed = pinned
+        group.pool = [k for k in group.members if k not in pinned]
+    return groups
 
 
-def _run_milp(
-    c: np.ndarray,
-    integrality: np.ndarray,
-    lb: np.ndarray,
-    ub: np.ndarray,
-    rows: list[np.ndarray],
-    rlb: list[float],
-    rub: list[float],
-    time_limit: float,
-) -> object:
-    matrix = np.vstack(rows)
-    return milp(
-        c,
-        integrality=integrality,
-        bounds=Bounds(lb, ub),
-        constraints=LinearConstraint(matrix, np.asarray(rlb), np.asarray(rub)),
-        options={"time_limit": time_limit, "mip_rel_gap": 0.0, "disp": False},
-    )
+def _group_evidence(groups: list[_Group], conf: Confirmations) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for gid, group in enumerate(groups):
+        rows.append(
+            {
+                "group": gid,
+                "keys": list(group.members),
+                "size": group.size,
+                "unconfirmed_pool_size": group.pool_size,
+                "confirmed_keys": sorted(group.confirmed),
+                "count_bounds": {
+                    "segment_0": [
+                        sum(1 for k in group.confirmed if conf.get((0, k)) is True),
+                        group.size - sum(1 for k in group.confirmed if conf.get((0, k)) is False),
+                    ],
+                    "segment_1": [
+                        sum(1 for k in group.confirmed if conf.get((1, k)) is True),
+                        group.size - sum(1 for k in group.confirmed if conf.get((1, k)) is False),
+                    ],
+                },
+            }
+        )
+    return rows
 
 
-def _solver_diagnostics(model: str, result: object, conf: Confirmations) -> dict[str, object]:
+def _reference_model_size(n: int) -> dict[str, dict[str, int]]:
+    """Variable/constraint counts the original per-key MILPs would have.
+
+    Counts exclude the shared band rows and (for the different-set model) the
+    single global "at least one difference" row, which are identical in number
+    between the per-key and the aggregated formulations.
+    """
+    return {
+        # same: n binaries + 2n gains; 2 linkage rows per key per take.
+        "same_set": {"variables": 3 * n, "constraints": 4 * n},
+        # different: 2n binaries + 2n gains + n difference binaries;
+        # 2 linkage rows per key per take (4n) + 4 difference rows per key (4n).
+        "different_set": {"variables": 5 * n, "constraints": 8 * n},
+    }
+
+
+# ---------------------------------------------------------------------------
+# sparse MILP bookkeeping
+# ---------------------------------------------------------------------------
+class _MilpBuilder:
+    """Accumulate variables and sparse rows for one MILP."""
+
+    def __init__(self) -> None:
+        self.lb: list[float] = []
+        self.ub: list[float] = []
+        self.integrality: list[int] = []
+        self.rows: list[dict[int, float]] = []
+        self.rlb: list[float] = []
+        self.rub: list[float] = []
+        self.objective: list[float] = []
+        # Rows added via :meth:`band_constraint` are the per-take band rows,
+        # which are identical in count to the original per-key formulation and
+        # are therefore reported separately rather than as aggregation savings.
+        self.band_rows = 0
+        # Rows added as global cross-group coupling (the single difference
+        # requirement); also counted separately for a like-for-like footprint.
+        self.global_rows = 0
+
+    def var(self, lb: float, ub: float, integer: bool, cost: float = 0.0) -> int:
+        idx = len(self.lb)
+        self.lb.append(lb)
+        self.ub.append(ub)
+        self.integrality.append(1 if integer else 0)
+        self.objective.append(cost)
+        return idx
+
+    def constraint(self, coefficients: dict[int, float], lb: float, ub: float) -> None:
+        self.rows.append(dict(coefficients))
+        self.rlb.append(lb)
+        self.rub.append(ub)
+
+    def band_constraint(self, coefficients: dict[int, float], lb: float, ub: float) -> None:
+        self.constraint(coefficients, lb, ub)
+        self.band_rows += 1
+
+    def fix(self, idx: int, value: float) -> None:
+        self.lb[idx] = self.ub[idx] = value
+
+    def solve(self, time_limit: float) -> object:
+        nv = len(self.lb)
+        matrix = np.zeros((len(self.rows), nv))
+        for i, row in enumerate(self.rows):
+            for j, value in row.items():
+                matrix[i, j] = value
+        return milp(
+            np.asarray(self.objective, dtype=float),
+            integrality=np.asarray(self.integrality),
+            bounds=Bounds(np.asarray(self.lb), np.asarray(self.ub)),
+            constraints=LinearConstraint(matrix, np.asarray(self.rlb), np.asarray(self.rub)),
+            options={"time_limit": time_limit, "mip_rel_gap": 0.0, "disp": False},
+        )
+
+    @property
+    def size(self) -> dict[str, int]:
+        """Aggregated model size, excluding formulation-neutral band/global rows."""
+        return {
+            "variables": len(self.lb),
+            "constraints": len(self.rows) - self.band_rows - self.global_rows,
+        }
+
+
+def _solver_diagnostics(
+    model: str,
+    result: object,
+    conf: Confirmations,
+    groups: list[_Group],
+    size: dict[str, int],
+    n: int,
+) -> dict[str, object]:
     return {
         "model": model,
         "solver_status": int(getattr(result, "status", -1)),
         "solver_message": str(getattr(result, "message", "unknown solver status")),
         "mip_node_count": getattr(result, "mip_node_count", None),
+        "group_count": len(groups),
+        "model_size": size,
+        "per_key_model_size": _reference_model_size(n)[model],
         "confirmations": {f"{seg}:{key}": pressed for (seg, key), pressed in sorted(conf.items())},
     }
 
 
 # ---------------------------------------------------------------------------
-# witness extraction and verification
+# witness extraction, expansion, and verification
 # ---------------------------------------------------------------------------
-def _witness(
-    templates: np.ndarray,
-    n: int,
-    bits: np.ndarray,
-    raw_gains: np.ndarray,
-    energy: np.ndarray,
-    error: np.ndarray,
-    lo: np.ndarray,
-    hi: np.ndarray,
-) -> Solution | None:
-    """Turn solver output into a verified witness, or ``None`` if unusable."""
-    pressed_bits = np.rint(bits).astype(int)
-    pressed = [k for k in range(n) if pressed_bits[k] == 1]
-    gains = np.zeros(n)
-    for k in pressed:
-        gains[k] = float(raw_gains[k])
-        # Clip only floating-point drift back onto the closed interval.
-        if gains[k] < float(lo[k]) and float(lo[k]) - gains[k] <= _FEAS_TOL:
-            gains[k] = float(lo[k])
-        if gains[k] > float(hi[k]) and gains[k] - float(hi[k]) <= _FEAS_TOL:
-            gains[k] = float(hi[k])
-
-    if not _verify(templates, gains, pressed, energy, error, lo, hi):
-        # Fallback: re-solve gains for this fixed pressed set.
-        recovered = _feasible_gains(templates, pressed, energy, error, lo, hi)
-        if recovered is None:
-            return None
-        gains = recovered
-        if not _verify(templates, gains, pressed, energy, error, lo, hi):
-            return None
-
-    gain_map = {k: float(gains[k]) for k in pressed}
-    return Solution(pressed=pressed, gains=gain_map)
-
-
 def _verify(
     templates: np.ndarray,
     gains: np.ndarray,
@@ -297,8 +389,51 @@ def _feasible_gains(
     return gains
 
 
+def _split_pooled_gain(pool: list[int], pooled: float, lo: float, hi: float) -> dict[int, float]:
+    """Split a pooled group gain over chosen members within the shared interval."""
+    q = len(pool)
+    if q == 0:
+        return {}
+    share = pooled / q
+    if lo - _FEAS_TOL <= share <= hi + _FEAS_TOL:
+        share = min(max(share, lo), hi)
+        return {k: share for k in pool}
+    # General fallback respecting closed intervals: fill at the lower bound and
+    # put the remainder on the last member.
+    gains = {k: lo for k in pool}
+    remainder = pooled - q * lo
+    last = pool[-1]
+    gains[last] += remainder
+    if gains[last] > hi + _FEAS_TOL:  # pragma: no cover - guarded by the pool linkage
+        gains[last] = hi
+    return gains
+
+
+def _build_solution(
+    templates: np.ndarray,
+    pressed: list[int],
+    gains_map: dict[int, float],
+    energy: np.ndarray,
+    error: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+) -> Solution | None:
+    """Verify an expanded witness; re-solve its gains once as a fallback."""
+    gains = np.zeros(templates.shape[0])
+    for k in pressed:
+        gains[k] = float(gains_map[k])
+    if not _verify(templates, gains, pressed, energy, error, lo, hi):
+        recovered = _feasible_gains(templates, pressed, energy, error, lo, hi)
+        if recovered is None:
+            return None
+        gains = recovered
+        if not _verify(templates, gains, pressed, energy, error, lo, hi):
+            return None
+    return Solution(pressed=list(pressed), gains={k: float(gains[k]) for k in pressed})
+
+
 # ---------------------------------------------------------------------------
-# hypothesis models
+# same-set model: one pressed state shared by both takes
 # ---------------------------------------------------------------------------
 def _same_set_model(
     templates: np.ndarray,
@@ -309,64 +444,140 @@ def _same_set_model(
     lo: np.ndarray,
     hi: np.ndarray,
     conf: Confirmations,
+    groups: list[_Group],
     time_limit: float,
 ) -> Outcome:
     n, m = templates.shape
-    nv = 3 * n
-    c = np.zeros(nv)
-    c[:n] = 1.0  # prefer small witnesses; any feasible one is valid
-    integrality = np.zeros(nv)
-    integrality[:n] = 1
-    lb = np.zeros(nv)
-    ub = np.zeros(nv)
-    ub[:n] = 1.0
-    rows: list[np.ndarray] = []
-    rlb: list[float] = []
-    rub: list[float] = []
+    builder = _MilpBuilder()
+    layout: dict[str, object] = {"segment": 0}
 
-    _add_gain_block(n, m, templates, b1, e1, lo, hi, 0, n, nv, lb, ub, rows, rlb, rub)
-    _add_gain_block(n, m, templates, b2, e2, lo, hi, 0, 2 * n, nv, lb, ub, rows, rlb, rub)
-
-    # Same-set hypothesis: a key's pressed state is shared, so confirmations
-    # for the two segments must agree.  Disagreement makes this model
-    # infeasible (it is evidence for "different"), not an input error.
-    pinned: dict[int, bool] = {}
-    pinned_segment: dict[int, int] = {}
-    for (seg, key), pressed in conf.items():
-        if key in pinned and pinned[key] != pressed:
-            return Outcome(
-                feasible=False,
-                takes=None,
-                evidence={
-                    "model": "same_set",
-                    "reason": "confirmations_imply_different_press_state",
-                    "key_index": key,
-                    "confirmed": {
-                        "segment": pinned_segment[key],
-                        "pressed": pinned[key],
+    for gid, group in enumerate(groups):
+        info: dict[str, object] = {"confirmed": {}}
+        # A key confirmed in either take gets one shared binary and two gains.
+        for key in sorted(group.confirmed):
+            p0 = conf.get((0, key))
+            p1 = conf.get((1, key))
+            if p0 is not None and p1 is not None and p0 != p1:
+                return Outcome(
+                    feasible=False,
+                    takes=None,
+                    evidence={
+                        "model": "same_set",
+                        "reason": "confirmations_imply_different_press_state",
+                        "key_index": key,
+                        "confirmed": {"segment": 0, "pressed": p0},
+                        "conflicting": {"segment": 1, "pressed": p1},
                     },
-                    "conflicting": {"segment": seg, "pressed": pressed},
-                },
-            )
-        pinned[key] = pressed
-        pinned_segment[key] = seg
-    for key, pressed in pinned.items():
-        lb[key] = ub[key] = 1.0 if pressed else 0.0
+                )
+            x = builder.var(0.0, 1.0, integer=True, cost=1.0)
+            g1 = builder.var(0.0, group.hi, integer=False)
+            g2 = builder.var(0.0, group.hi, integer=False)
+            pressed = p0 if p0 is not None else p1
+            if pressed is not None:
+                builder.fix(x, 1.0 if pressed else 0.0)
+            builder.constraint({g1: 1.0, x: -group.hi}, -_INF, 0.0)
+            builder.constraint({x: group.lo, g1: -1.0}, -_INF, 0.0)
+            builder.constraint({g2: 1.0, x: -group.hi}, -_INF, 0.0)
+            builder.constraint({x: group.lo, g2: -1.0}, -_INF, 0.0)
+            info["confirmed"][key] = (x, g1, g2)
 
-    result = _run_milp(c, integrality, lb, ub, rows, rlb, rub, time_limit)
+        u = group.pool_size
+        if u > 0:
+            # Pool members are unconfirmed in both takes by construction, so
+            # the shared count ranges over the whole pool.
+            q = builder.var(0.0, float(u), integer=True, cost=1.0)
+            g1 = builder.var(0.0, u * group.hi, integer=False)
+            g2 = builder.var(0.0, u * group.hi, integer=False)
+            builder.constraint({g1: 1.0, q: -group.hi}, -_INF, 0.0)
+            builder.constraint({q: group.lo, g1: -1.0}, -_INF, 0.0)
+            builder.constraint({g2: 1.0, q: -group.hi}, -_INF, 0.0)
+            builder.constraint({q: group.lo, g2: -1.0}, -_INF, 0.0)
+            info["q"] = q
+            info["g1"] = g1
+            info["g2"] = g2
+        layout[gid] = info
+
+    # One band row per take and band, expressed on group-level gains.
+    for seg, energy, error, gain_kind in ((0, b1, e1, 1), (1, b2, e2, 2)):
+        for j in range(m):
+            row: dict[int, float] = {}
+            for gid, group in enumerate(groups):
+                info = layout[gid]
+                for key, var_info in info["confirmed"].items():  # type: ignore[index]
+                    g_idx = var_info[gain_kind]
+                    row[g_idx] = row.get(g_idx, 0.0) + float(group.template[j])
+                if group.pool_size > 0:
+                    g_idx = info["g1"] if gain_kind == 1 else info["g2"]  # type: ignore[index]
+                    row[g_idx] = row.get(g_idx, 0.0) + float(group.template[j])
+            builder.band_constraint(row, float(energy[j] - error[j]), float(energy[j] + error[j]))
+
+    result = builder.solve(time_limit)
     status = int(getattr(result, "status", -1))
     if status == _OPTIMAL:
-        x = np.asarray(result.x)
-        sol1 = _witness(templates, n, x[:n], x[n : 2 * n], b1, e1, lo, hi)
-        sol2 = _witness(templates, n, x[:n], x[2 * n : 3 * n], b2, e2, lo, hi)
+        values = np.asarray(result.x)
+        # Re-map the shared layout into per-segment expansion layouts.
+        sol1 = _expand_same(templates, groups, conf, values, b1, e1, lo, hi, layout, segment=0)
+        sol2 = _expand_same(templates, groups, conf, values, b2, e2, lo, hi, layout, segment=1)
         if sol1 is None or sol2 is None or sol1.pressed != sol2.pressed:
             raise SolverInconclusive("same-set witness failed verification")
-        return Outcome(feasible=True, takes=(sol1, sol2), evidence={"model": "same_set", "status": "optimal"})
+        return Outcome(
+            feasible=True,
+            takes=(sol1, sol2),
+            evidence={
+                "model": "same_set",
+                "status": "optimal",
+                "group_count": len(groups),
+                "model_size": builder.size,
+                "per_key_model_size": _reference_model_size(n)["same_set"],
+            },
+        )
     if status == _INFEASIBLE:
-        return Outcome(feasible=False, takes=None, evidence=_solver_diagnostics("same_set", result, conf))
+        return Outcome(
+            feasible=False,
+            takes=None,
+            evidence=_solver_diagnostics("same_set", result, conf, groups, builder.size, n),
+        )
     raise SolverInconclusive(f"same-set model inconclusive: {getattr(result, 'message', status)}")
 
 
+def _expand_same(
+    templates: np.ndarray,
+    groups: list[_Group],
+    conf: Confirmations,
+    values: np.ndarray,
+    energy: np.ndarray,
+    error: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    layout: dict[str, object],
+    segment: int,
+) -> Solution | None:
+    pressed: list[int] = []
+    gains_map: dict[int, float] = {}
+    for gid, group in enumerate(groups):
+        info = layout[gid]
+        for key, var_info in info["confirmed"].items():  # type: ignore[index]
+            x_idx, g1_idx, g2_idx = var_info
+            g_idx = g1_idx if segment == 0 else g2_idx
+            if int(np.rint(values[x_idx])) == 1:
+                pressed.append(key)
+                gains_map[key] = float(values[g_idx])
+        if group.pool_size > 0:
+            q = int(np.rint(values[info["q"]]))  # type: ignore[index]
+            g_idx = info["g1"] if segment == 0 else info["g2"]  # type: ignore[index]
+            chosen = list(group.pool[:q])
+            gains_map.update(_split_pooled_gain(chosen, float(values[g_idx]), group.lo, group.hi))
+            pressed.extend(chosen)
+        for key in group.confirmed:
+            if (segment, key) in conf and ((key in pressed) != conf[(segment, key)]):
+                return None
+    pressed.sort()
+    return _build_solution(templates, pressed, gains_map, energy, error, lo, hi)
+
+
+# ---------------------------------------------------------------------------
+# different-set model: per-segment states with at least one differing key
+# ---------------------------------------------------------------------------
 def _different_set_model(
     templates: np.ndarray,
     b1: np.ndarray,
@@ -376,78 +587,203 @@ def _different_set_model(
     lo: np.ndarray,
     hi: np.ndarray,
     conf: Confirmations,
+    groups: list[_Group],
     time_limit: float,
 ) -> Outcome:
     n, m = templates.shape
-    # Layout: x1 | x2 | g1 | g2 | d
-    nv = 5 * n
-    c = np.zeros(nv)
-    c[: 2 * n] = 1.0
-    integrality = np.zeros(nv)
-    integrality[: 2 * n] = 1
-    lb = np.zeros(nv)
-    ub = np.zeros(nv)
-    ub[: 2 * n] = 1.0
-    ub[4 * n : 5 * n] = 1.0
-    rows: list[np.ndarray] = []
-    rlb: list[float] = []
-    rub: list[float] = []
+    builder = _MilpBuilder()
+    layout: dict[str, object] = {"segment": 0}
 
-    _add_gain_block(n, m, templates, b1, e1, lo, hi, 0, 2 * n, nv, lb, ub, rows, rlb, rub)
-    _add_gain_block(n, m, templates, b2, e2, lo, hi, n, 3 * n, nv, lb, ub, rows, rlb, rub)
+    for gid, group in enumerate(groups):
+        info: dict[str, object] = {"confirmed": {}, "indicators": []}
+        indicators: list[int] = info["indicators"]  # type: ignore[assignment]
+        # Confirmed keys: one binary and one gain per segment.  Each confirmed
+        # key also contributes a difference indicator d = |x0 - x1|, since a
+        # confirmed member can distinguish two takes even inside a pooled group.
+        for key in sorted(group.confirmed):
+            per_seg: dict[int, tuple[int, int]] = {}
+            for seg in (0, 1):
+                x = builder.var(0.0, 1.0, integer=True, cost=1.0)
+                g = builder.var(0.0, group.hi, integer=False)
+                pressed = conf.get((seg, key))
+                if pressed is not None:
+                    builder.fix(x, 1.0 if pressed else 0.0)
+                builder.constraint({g: 1.0, x: -group.hi}, -_INF, 0.0)
+                builder.constraint({x: group.lo, g: -1.0}, -_INF, 0.0)
+                per_seg[seg] = (x, g)
+            info["confirmed"][key] = per_seg
+            d = builder.var(0.0, 1.0, integer=True)
+            x0, x1 = per_seg[0][0], per_seg[1][0]
+            builder.constraint({d: 1.0, x0: -1.0, x1: 1.0}, 0.0, _INF)
+            builder.constraint({d: 1.0, x0: 1.0, x1: -1.0}, 0.0, _INF)
+            builder.constraint({d: 1.0, x0: -1.0, x1: -1.0}, -_INF, 0.0)
+            builder.constraint({d: 1.0, x0: 1.0, x1: 1.0}, -_INF, 2.0)
+            indicators.append(d)
 
-    for k in range(n):
-        d = 4 * n + k
-        # d >= x1 - x2
-        row = np.zeros(nv)
-        row[d], row[k], row[n + k] = 1.0, -1.0, 1.0
-        rows.append(row)
-        rlb.append(0.0)
-        rub.append(_INF)
-        # d >= x2 - x1
-        row = np.zeros(nv)
-        row[d], row[k], row[n + k] = 1.0, 1.0, -1.0
-        rows.append(row)
-        rlb.append(0.0)
-        rub.append(_INF)
-        # d <= x1 + x2
-        row = np.zeros(nv)
-        row[d], row[k], row[n + k] = 1.0, -1.0, -1.0
-        rows.append(row)
-        rlb.append(-_INF)
-        rub.append(0.0)
-        # d <= 2 - x1 - x2
-        row = np.zeros(nv)
-        row[d], row[k], row[n + k] = 1.0, 1.0, 1.0
-        rows.append(row)
-        rlb.append(-_INF)
-        rub.append(2.0)
+        u = group.pool_size
+        if u > 0:
+            # Pool members are unconfirmed in both takes by construction.
+            qs: dict[int, int] = {}
+            gs: dict[int, int] = {}
+            for seg in (0, 1):
+                q = builder.var(0.0, float(u), integer=True, cost=1.0)
+                g = builder.var(0.0, u * group.hi, integer=False)
+                builder.constraint({g: 1.0, q: -group.hi}, -_INF, 0.0)
+                builder.constraint({q: group.lo, g: -1.0}, -_INF, 0.0)
+                qs[seg] = q
+                gs[seg] = g
+            info["q"] = qs
+            info["g"] = gs
 
-    # Require at least one different key.
-    row = np.zeros(nv)
-    row[4 * n : 5 * n] = 1.0
-    rows.append(row)
-    rlb.append(1.0)
-    rub.append(_INF)
+            # Exact indicator that the two segments' pressed counts in the
+            # pool differ.
+            q0, q1 = qs[0], qs[1]
+            if u == 1:
+                # A singleton pool has binary counts, so the cheap exact
+                # |q0 - q1| linearisation applies, matching one per-key block.
+                d = builder.var(0.0, 1.0, integer=True)
+                builder.constraint({d: 1.0, q0: -1.0, q1: 1.0}, 0.0, _INF)
+                builder.constraint({d: 1.0, q0: 1.0, q1: -1.0}, 0.0, _INF)
+                builder.constraint({d: 1.0, q0: -1.0, q1: -1.0}, -_INF, 0.0)
+                builder.constraint({d: 1.0, q0: 1.0, q1: 1.0}, -_INF, 2.0)
+                indicators.append(d)
+                info["dp"], info["dm"] = d, d
+            else:
+                # For general integer counts in [0, u] two direction binaries
+                # are needed: a single binary cannot be forced back to 0 when
+                # the difference s = q0 - q1 is zero by linear rows alone.
+                #   dp = 1 iff s >= 1 (take 0 presses more pool keys),
+                #   dm = 1 iff -s >= 1 (take 1 presses more pool keys).
+                # Each uses the standard two-row big-M with M = u, e.g. dp:
+                #   s - u*dp <= 0  and  s - (u+1)*dp >= -u.
+                dp = builder.var(0.0, 1.0, integer=True)
+                dm = builder.var(0.0, 1.0, integer=True)
+                builder.constraint({q0: 1.0, q1: -1.0, dp: float(-u)}, -_INF, 0.0)
+                builder.constraint(
+                    {q0: 1.0, q1: -1.0, dp: float(-(u + 1))}, float(-u), _INF
+                )
+                builder.constraint({q0: -1.0, q1: 1.0, dm: float(-u)}, -_INF, 0.0)
+                builder.constraint(
+                    {q0: -1.0, q1: 1.0, dm: float(-(u + 1))}, float(-u), _INF
+                )
+                indicators.append(dp)
+                indicators.append(dm)
+                info["dp"], info["dm"] = dp, dm
 
-    for (seg, key), pressed in conf.items():
-        idx = key if seg == 0 else n + key
-        lb[idx] = ub[idx] = 1.0 if pressed else 0.0
+            # z = 1 allows equal counts realized by different member subsets.
+            # Possible only for an interior count while an unconfirmed pool of
+            # at least two keys remains: z = 1 forces 1 <= q_t <= u - 1.
+            if u >= 2:
+                z = builder.var(0.0, 1.0, integer=True)
+                for q in qs.values():
+                    # q - z >= 0: when z = 1, q >= 1.
+                    builder.constraint({q: 1.0, z: -1.0}, 0.0, _INF)
+                    # q + z <= u: when z = 1, q <= u - 1, so an interior
+                    # count leaves room for two distinct q-sized subsets.
+                    builder.constraint({q: 1.0, z: 1.0}, -_INF, float(u))
+                indicators.append(z)
+                info["z"] = z
+            else:
+                info["z"] = None
+        layout[gid] = info
 
-    result = _run_milp(c, integrality, lb, ub, rows, rlb, rub, time_limit)
+    # At least one group must realize a difference.  This is the analogue of
+    # the original per-key model's single global sum-of-differences row.
+    diff_row: dict[int, float] = {}
+    for gid in range(len(groups)):
+        for d in layout[gid]["indicators"]:  # type: ignore[index]
+            diff_row[d] = 1.0
+    builder.constraint(diff_row, 1.0, _INF)
+    builder.global_rows += 1
+
+    for seg, energy, error in ((0, b1, e1), (1, b2, e2)):
+        for j in range(m):
+            row: dict[int, float] = {}
+            for gid, group in enumerate(groups):
+                info = layout[gid]
+                for key, per_seg in info["confirmed"].items():  # type: ignore[index]
+                    g_idx = per_seg[seg][1]
+                    row[g_idx] = row.get(g_idx, 0.0) + float(group.template[j])
+                if group.pool_size > 0:
+                    g_idx = info["g"][seg]  # type: ignore[index]
+                    row[g_idx] = row.get(g_idx, 0.0) + float(group.template[j])
+            builder.band_constraint(row, float(energy[j] - error[j]), float(energy[j] + error[j]))
+
+    result = builder.solve(time_limit)
     status = int(getattr(result, "status", -1))
     if status == _OPTIMAL:
-        x = np.asarray(result.x)
-        sol1 = _witness(templates, n, x[:n], x[2 * n : 3 * n], b1, e1, lo, hi)
-        sol2 = _witness(templates, n, x[n : 2 * n], x[3 * n : 4 * n], b2, e2, lo, hi)
+        values = np.asarray(result.x)
+        sol1 = _expand_different(templates, groups, conf, values, b1, e1, lo, hi, layout, segment=0)
+        sol2 = _expand_different(templates, groups, conf, values, b2, e2, lo, hi, layout, segment=1)
         if sol1 is None or sol2 is None or sol1.pressed == sol2.pressed:
             raise SolverInconclusive("different-set witness failed verification")
         return Outcome(
-            feasible=True, takes=(sol1, sol2), evidence={"model": "different_set", "status": "optimal"}
+            feasible=True,
+            takes=(sol1, sol2),
+            evidence={
+                "model": "different_set",
+                "status": "optimal",
+                "group_count": len(groups),
+                "model_size": builder.size,
+                "per_key_model_size": _reference_model_size(n)["different_set"],
+            },
         )
     if status == _INFEASIBLE:
-        return Outcome(feasible=False, takes=None, evidence=_solver_diagnostics("different_set", result, conf))
+        return Outcome(
+            feasible=False,
+            takes=None,
+            evidence=_solver_diagnostics("different_set", result, conf, groups, builder.size, n),
+        )
     raise SolverInconclusive(f"different-set model inconclusive: {getattr(result, 'message', status)}")
+
+
+def _expand_different(
+    templates: np.ndarray,
+    groups: list[_Group],
+    conf: Confirmations,
+    values: np.ndarray,
+    energy: np.ndarray,
+    error: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    layout: dict[str, object],
+    segment: int,
+) -> Solution | None:
+    pressed: list[int] = []
+    gains_map: dict[int, float] = {}
+    for gid, group in enumerate(groups):
+        info = layout[gid]
+        for key, per_seg in info["confirmed"].items():  # type: ignore[index]
+            x_idx, g_idx = per_seg[segment]
+            if int(np.rint(values[x_idx])) == 1:
+                pressed.append(key)
+                gains_map[key] = float(values[g_idx])
+        if group.pool_size > 0:
+            q0 = int(np.rint(values[info["q"][0]]))  # type: ignore[index]
+            q1 = int(np.rint(values[info["q"][1]]))  # type: ignore[index]
+            q = q0 if segment == 0 else q1
+            g_idx = info["g"][segment]  # type: ignore[index]
+            z_idx = info.get("z")
+            swap = z_idx is not None and int(np.rint(values[z_idx])) == 1
+            # Two different member subsets are needed either when the pressed
+            # counts differ (dp/dm) or when equal counts are swapped (z).
+            # Segment 0 takes the first q pool members, segment 1 the last q;
+            # both constructions stay inside the pool and differ whenever the
+            # MILP required this group to supply the distinguishing key.
+            distinct_here = swap or q0 != q1
+            if distinct_here:
+                u = group.pool_size
+                start = 0 if segment == 0 else u - q
+                chosen = list(group.pool[start : start + q])
+            else:
+                chosen = list(group.pool[:q])
+            gains_map.update(_split_pooled_gain(chosen, float(values[g_idx]), group.lo, group.hi))
+            pressed.extend(chosen)
+        for key in group.confirmed:
+            if (segment, key) in conf and ((key in pressed) != conf[(segment, key)]):
+                return None
+    pressed.sort()
+    return _build_solution(templates, pressed, gains_map, energy, error, lo, hi)
 
 
 # ---------------------------------------------------------------------------
@@ -484,8 +820,10 @@ def classify(
     conf: Confirmations = dict(confirmations or {})
     _check_confirmations(conf, n)
 
-    same = _same_set_model(templates, b1, e1, b2, e2, lo, hi, conf, time_limit)
-    different = _different_set_model(templates, b1, e1, b2, e2, lo, hi, conf, time_limit)
+    groups = _build_groups(templates, lo, hi, conf)
+
+    same = _same_set_model(templates, b1, e1, b2, e2, lo, hi, conf, groups, time_limit)
+    different = _different_set_model(templates, b1, e1, b2, e2, lo, hi, conf, groups, time_limit)
 
     possibilities: dict[str, tuple[Solution, Solution]] = {}
     if same.feasible and same.takes is not None:
@@ -506,6 +844,8 @@ def classify(
         "same_set_feasible": same.feasible,
         "different_set_feasible": different.feasible,
         "models": {"same": same.evidence, "different": different.evidence},
+        "key_groups": _group_evidence(groups, conf),
+        "group_count": len(groups),
     }
     if kind == "impossible":
         evidence["reason"] = "conflicting_evidence"

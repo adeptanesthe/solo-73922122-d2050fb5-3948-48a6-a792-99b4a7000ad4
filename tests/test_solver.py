@@ -181,3 +181,127 @@ def test_confirmation_conflict_evidence() -> None:
     )
     assert verdict.kind == "different"
     assert verdict.evidence["models"]["same"]["reason"] == "confirmations_imply_different_press_state"
+
+
+# ---------------------------------------------------------------------------
+# equivalence-group aggregation
+# ---------------------------------------------------------------------------
+def _one_group_instance(n: int, bands: int = 3):
+    """n keys sharing one template row and one gain interval."""
+    row = np.full(bands, 0.7)
+    templates = np.tile(row, (n, 1))
+    lo = np.full(n, 0.4)
+    hi = np.full(n, 1.6)
+    energy = row.copy()  # one key at gain 1 reproduces it
+    error = np.full(bands, 1e-9)
+    return templates, lo, hi, energy, error
+
+
+def test_groups_partition_identical_template_and_bounds() -> None:
+    templates = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    lo = np.array([0.5, 0.5, 0.9])
+    hi = np.array([2.0, 2.0, 2.0])
+    groups = solver._build_groups(templates, lo, hi, {})
+    assert [g.members for g in groups] == [[0, 1], [2]]
+    assert groups[0].pool == [0, 1] and groups[0].pool_size == 2
+    # A differing gain interval splits otherwise identical rows.
+    lo2 = np.array([0.5, 0.6, 0.9])
+    groups2 = solver._build_groups(templates, lo2, hi, {})
+    assert [g.members for g in groups2] == [[0], [1], [2]]
+
+
+def test_24_single_group_smaller_than_per_key_model() -> None:
+    n = 24
+    templates, lo, hi, energy, error = _one_group_instance(n)
+    verdict = solver.classify(
+        templates, (energy, energy), (error, error), lo, hi, time_limit=30.0
+    )
+    for model in ("same", "different"):
+        actual = verdict.evidence["models"][model]["model_size"]
+        per_key = verdict.evidence["models"][model]["per_key_model_size"]
+        assert actual["variables"] < per_key["variables"]
+        assert actual["constraints"] < per_key["constraints"]
+    # The report still names concrete keys and per-key gains in each witness.
+    for _name, takes in verdict.possibilities.items():
+        for take in takes:
+            assert take.gains.keys() == set(take.pressed)
+            for k in take.pressed:
+                assert lo[k] - 1e-7 <= take.gains[k] <= hi[k] + 1e-7
+
+
+def test_adding_unconfirmed_group_key_adds_no_variables_or_constraints() -> None:
+    def sizes(n: int):
+        templates, lo, hi, energy, error = _one_group_instance(n)
+        verdict = solver.classify(
+            templates, (energy, energy), (error, error), lo, hi, time_limit=30.0
+        )
+        return {
+            model: verdict.evidence["models"][model]["model_size"]
+            for model in ("same", "different")
+        }
+
+    assert sizes(3) == sizes(7) == sizes(13) == sizes(24)
+
+    # A confirmed member keeps its own binary/gain variables, but adding more
+    # *unconfirmed* members on top of that confirmation still adds nothing.
+    def confirmed_sizes(n: int):
+        templates, lo, hi, energy, error = _one_group_instance(n)
+        verdict = solver.classify(
+            templates, (energy, energy), (error, error), lo, hi,
+            confirmations={(0, 0): True}, time_limit=30.0,
+        )
+        return {
+            model: verdict.evidence["models"][model]["model_size"]
+            for model in ("same", "different")
+        }
+
+    assert confirmed_sizes(5) == confirmed_sizes(12)
+    assert confirmed_sizes(5)["same"]["variables"] > sizes(5)["same"]["variables"]
+
+
+def test_equal_group_count_can_still_mean_different_key_names() -> None:
+    # Two keys share a template; one unit of energy is one key at gain 1.
+    templates = np.array([[1.0], [1.0]])
+    lo = np.array([0.5, 0.5])
+    hi = np.array([1.0, 1.0])
+    b = np.array([1.0])
+    e = np.array([0.0])
+    verdict = solver.classify(templates, (b, b), (e, e), lo, hi)
+    assert verdict.kind == "both"
+    same = verdict.possibilities["same"]
+    different = verdict.possibilities["different"]
+    # Same-set witness: identical concrete key set in both takes.
+    assert same[0].pressed == same[1].pressed
+    # Different-set witness: same group count (one key) but different names.
+    assert different[0].pressed != different[1].pressed
+    assert len(different[0].pressed) == len(different[1].pressed) == 1
+    for take in different:
+        produced = sum(take.gains[k] for k in take.pressed)
+        assert abs(produced - 1.0) <= 1e-7
+
+
+def test_group_witnesses_always_verify_against_original_templates() -> None:
+    rng = np.random.default_rng(99)
+    n, m = 6, 3
+    base = rng.integers(0, 3, size=(3, m)).astype(float)
+    assign = rng.integers(0, 3, size=n)
+    templates = base[assign]
+    lo = np.full(n, 0.3)
+    hi = np.full(n, 1.8)
+    for _ in range(25):
+        pressed = rng.choice(n, size=int(rng.integers(1, 4)), replace=False)
+        gains = np.zeros(n)
+        for k in pressed:
+            gains[k] = rng.uniform(lo[k], hi[k])
+        energy = gains @ templates
+        error = np.full(m, 1e-9)
+        verdict = solver.classify(
+            templates, (energy, energy), (error, error), lo, hi, time_limit=20.0
+        )
+        for _hyp, takes in verdict.possibilities.items():
+            for take in takes:
+                rebuilt = np.zeros(n)
+                for k in take.pressed:
+                    rebuilt[k] = take.gains[k]
+                assert np.all(np.abs(rebuilt @ templates - energy) <= error + 1e-7)
+
